@@ -3,23 +3,23 @@ package main
 import (
 	"fmt"
 	"net/http"
-	"github.com/garyburd/redigo/redis"
 	"encoding/json"
 	"io/ioutil"
 	"strconv"
 	"strings"
 	"time"
 	"sort"
+	"container/list"
 	"os"
 )
 
-func median(nums []interface{}) float64 {
+func median(nums *list.List) float64 {
 	var float_prices []float64
 	float_prices = make([]float64, 5)
-	for i, p := range nums {
-		str_price := string(p.([]byte))
-		float_price, _ := strconv.ParseFloat(str_price, 64)
-		float_prices[i] = float_price
+	e := nums.Front()
+	for i := 0; i < 5; i++ {
+		float_prices[i] = e.Value.(float64)
+		e = e.Next()
 	}
 	sort.Float64s(float_prices)
 	fmt.Printf("%v\n", float_prices)
@@ -31,12 +31,13 @@ func main() {
 	trade_url := "https://data.mtgox.com/api/1/BTCUSD/trades"
 	post_url := os.ExpandEnv("$ALERT_API_URL")
 
-	// Connect to redis
-	r, _ := redis.Dial("tcp", os.ExpandEnv("$REDIS_URL"))
-
+	// Track last fetched trade
 	var tid int64
 	tid = 0
-	prev_med := 0.0
+
+	// Most recent trades
+	tradeHistory := list.New()
+
 	for {
 		// Fetch last trades
 		var url string
@@ -54,30 +55,30 @@ func main() {
 		trades := rawJson.(map[string]interface{})
 		for _, u := range trades["return"].([]interface{}) {
 			trade := u.(map[string]interface{})
+			tradePrice := trade["price"].(string)
+			float_price, _ := strconv.ParseFloat(tradePrice, 64)
 
-			// Store trade in redis
-			r.Do("LPUSH", "mtgox.trades", trade["price"])
+			tradeHistory.PushBack(float_price)
+
+			if tradeHistory.Len() > 5 {
+				tradeHistory.Remove(tradeHistory.Front())
+			}
 
 			// Update latest tid
 			tid, _ = strconv.ParseInt(trade["tid"].(string), 10, 64)
 		}
-		r.Do("LTRIM", "mtgox.trades", 0, 4)
 
 		// Find median of last 5 trades
-		trade_list, _ := r.Do("LRANGE", "mtgox.trades", 0, 4)
-		med := median(trade_list.([]interface{}))
+		med := median(tradeHistory)
 
 		// Post to external service
-		if prev_med > 0 {
-			buf := "price=" + strconv.FormatFloat(med, 'f', 7, 64) +
-				"&timestamp=" + strconv.FormatInt(int64(time.Now().Unix()) * 1000, 10) + 
-				"&market=MTGOX"
-			fmt.Printf("Posting: %v to %v\n", buf, post_url)
-			http.Post(post_url, "application/x-www-form-urlencoded", strings.NewReader(buf))
-		}
+		buf := "price=" + strconv.FormatFloat(med, 'f', 7, 64) +
+			"&timestamp=" + strconv.FormatInt(int64(time.Now().Unix()) * 1000, 10) + 
+			"&market=MTGOX"
+		fmt.Printf("Posting: %v to %v\n", buf, post_url)
+		http.Post(post_url, "application/x-www-form-urlencoded", strings.NewReader(buf))
 
-		// Refresh previous median
-		prev_med = med
+		// Sleep
 		time.Sleep(40 * time.Second)
 	}
 
